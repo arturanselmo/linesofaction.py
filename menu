@@ -1,0 +1,288 @@
+# menu.py
+import pygame
+import sys
+from pygame.locals import *
+import math
+import pvia  # Importa o arquivo pvia.py para o modo PLAYER VS IA
+
+# Constantes para o Menu
+MENU_WIDTH = 800
+MENU_HEIGHT = 600
+BUTTON_WIDTH = 300
+BUTTON_HEIGHT = 60
+BUTTON_COLOR = (50, 50, 50)
+BUTTON_HOVER_COLOR = (80, 80, 80)
+TEXT_COLOR = (255, 255, 255)
+TITLE_COLOR = (255, 255, 255)
+BG_COLOR = (30, 10, 50)  # Cor de fundo gradiente inicial (roxos escuros)
+
+# Constantes para o Jogo
+BOARD_SIZE = 8
+SQUARE_SIZE = 80
+GAME_WIDTH = BOARD_SIZE * SQUARE_SIZE
+GAME_HEIGHT = BOARD_SIZE * SQUARE_SIZE
+LIGHT_SQUARE = (240, 217, 181)
+DARK_SQUARE = (181, 136, 99)
+BLACK_PIECE_COLOR = (0, 0, 0)
+WHITE_PIECE_COLOR = (255, 255, 255)
+SELECTED_COLOR = (0, 255, 0)
+VALID_MOVE_COLOR = (0, 0, 255)
+GAME_BG_COLOR = (50, 50, 50)
+
+# Inicialização do Pygame
+pygame.init()
+screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
+pygame.display.set_caption("Lines of Action - Menu")
+clock = pygame.time.Clock()
+
+# Fontes
+title_font = pygame.font.SysFont("Arial", 72, bold=True)
+button_font = pygame.font.SysFont("Arial", 36)
+game_font = pygame.font.SysFont(None, 36)
+
+# Funções do Menu
+def draw_gradient_background():
+    for y in range(MENU_HEIGHT):
+        r = 30 + (y / MENU_HEIGHT) * 20
+        g = 10 + (y / MENU_HEIGHT) * 20
+        b = 50 + (y / MENU_HEIGHT) * 50
+        pygame.draw.line(screen, (int(r), int(g), int(b)), (0, y), (MENU_WIDTH, y))
+
+def draw_button(text, x, y, width, height, hover=False):
+    color = BUTTON_HOVER_COLOR if hover else BUTTON_COLOR
+    pygame.draw.rect(screen, color, (x, y, width, height), border_radius=10)
+    pygame.draw.rect(screen, TEXT_COLOR, (x, y, width, height), 2, border_radius=10)
+    text_surface = button_font.render(text, True, TEXT_COLOR)
+    text_rect = text_surface.get_rect(center=(x + width // 2, y + height // 2))
+    screen.blit(text_surface, text_rect)
+
+# Funções do Jogo (PLAYER VS PLAYER)
+def init_board():
+    board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    for col in range(1, BOARD_SIZE - 1):
+        board[0][col] = "B"
+        board[BOARD_SIZE - 1][col] = "B"
+    for row in range(1, BOARD_SIZE - 1):
+        board[row][0] = "W"
+        board[row][BOARD_SIZE - 1] = "W"
+    return board
+
+def draw_board(screen, board, selected, valid_moves=None):
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            square_color = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
+            rect = pygame.Rect(col * SQUARE_SIZE, row * SQUARE_SIZE, SQUARE_SIZE, SQUARE_SIZE)
+            pygame.draw.rect(screen, square_color, rect)
+            if selected == (row, col):
+                pygame.draw.rect(screen, SELECTED_COLOR, rect, 3)
+            if valid_moves and (row, col) in valid_moves:
+                pygame.draw.rect(screen, VALID_MOVE_COLOR, rect, 3)
+            piece = board[row][col]
+            if piece is not None:
+                center = (col * SQUARE_SIZE + SQUARE_SIZE // 2, row * SQUARE_SIZE + SQUARE_SIZE // 2)
+                radius = SQUARE_SIZE // 2 - 8
+                if piece == "B":
+                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius)
+                elif piece == "W":
+                    pygame.draw.circle(screen, WHITE_PIECE_COLOR, center, radius)
+                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius, 2)
+
+def get_board_pos(mouse_pos):
+    x, y = mouse_pos
+    col = x // SQUARE_SIZE
+    row = y // SQUARE_SIZE
+    if 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE:
+        return (row, col)
+    return None
+
+def count_pieces_in_line(board, row, col, dr, dc):
+    count = 0
+    r, c = row, col
+    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+        if board[r][c] is not None:
+            count += 1
+        r += dr
+        c += dc
+    r, c = row - dr, col - dc
+    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+        if board[r][c] is not None:
+            count += 1
+        r -= dr
+        c -= dc
+    return count
+
+def sign(x):
+    return (x > 0) - (x < 0)
+
+def is_valid_move(board, selected, dest, current_player):
+    sr, sc = selected
+    dr = dest[0] - sr
+    dc = dest[1] - sc
+    if not ((dr == 0 and dc != 0) or (dc == 0 and dr != 0) or (abs(dr) == abs(dc) and dr != 0)):
+        return False, "Movimento fora de linha reta"
+    norm_dr = sign(dr)
+    norm_dc = sign(dc)
+    n = count_pieces_in_line(board, sr, sc, norm_dr, norm_dc)
+    expected_dest = (sr + n * norm_dr, sc + n * norm_dc)
+    if expected_dest != dest:
+        return False, "Distância incorreta; deve mover {} casas".format(n)
+    for i in range(1, n):
+        r = sr + i * norm_dr
+        c = sc + i * norm_dc
+        if board[r][c] is not None:
+            if board[r][c] != current_player:
+                return False, "Não pode saltar sobre peças adversárias"
+    dest_piece = board[dest[0]][dest[1]]
+    if dest_piece is not None and dest_piece == current_player:
+        return False, "Destino ocupado por peça amiga"
+    return True, ""
+
+def compute_valid_moves(board, selected, current_player):
+    valid_moves = []
+    if selected is None:
+        return valid_moves
+    sr, sc = selected
+    directions = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+    for dr, dc in directions:
+        n = count_pieces_in_line(board, sr, sc, dr, dc)
+        if n == 0:
+            continue
+        candidate = (sr + n * dr, sc + n * dc)
+        r, c = candidate
+        if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+            continue
+        valid, _ = is_valid_move(board, selected, candidate, current_player)
+        if valid:
+            valid_moves.append(candidate)
+    return valid_moves
+
+def get_all_pieces(board, player):
+    positions = []
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if board[row][col] == player:
+                positions.append((row, col))
+    return positions
+
+def check_connected(board, player):
+    pieces = get_all_pieces(board, player)
+    if not pieces:
+        return False
+    visited = set()
+    stack = [pieces[0]]
+    while stack:
+        pos = stack.pop()
+        if pos in visited:
+            continue
+        visited.add(pos)
+        r, c = pos
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    if board[nr][nc] == player and (nr, nc) not in visited:
+                        stack.append((nr, nc))
+    return len(visited) == len(pieces)
+
+def show_message(screen, text):
+    overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
+    overlay.set_alpha(200)
+    overlay.fill((0, 0, 0))
+    screen.blit(overlay, (0, 0))
+    msg = game_font.render(text, True, (255, 255, 0))
+    msg_rect = msg.get_rect(center=(GAME_WIDTH//2, GAME_HEIGHT//2))
+    screen.blit(msg, msg_rect)
+    pygame.display.flip()
+    pygame.time.wait(3000)
+
+def iniciar_jogo_pvp():
+    global screen
+    screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
+    pygame.display.set_caption("Lines of Action")
+
+    board = init_board()
+    current_player = "B"  # Preto começa
+    selected = None
+    game_over = False
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
+                pygame.display.set_caption("Lines of Action - Menu")
+                return
+            if game_over:
+                continue
+            if event.type == MOUSEBUTTONDOWN:
+                pos = get_board_pos(pygame.mouse.get_pos())
+                if pos is None:
+                    continue
+                r, c = pos
+                if selected is None:
+                    if board[r][c] == current_player:
+                        selected = (r, c)
+                else:
+                    valid, msg = is_valid_move(board, selected, pos, current_player)
+                    if valid:
+                        sr, sc = selected
+                        dr, dc = pos
+                        if board[dr][dc] is not None and board[dr][dc] != current_player:
+                            board[dr][dc] = None
+                        board[dr][dc] = current_player
+                        board[sr][sc] = None
+                        if check_connected(board, current_player):
+                            draw_board(screen, board, None)
+                            pygame.display.flip()
+                            show_message(screen, f"Vitória para { 'Preto' if current_player=='B' else 'Branco' }!")
+                            game_over = True
+                        else:
+                            current_player = "W" if current_player == "B" else "B"
+                        selected = None
+                    else:
+                        print("Movimento inválido:", msg)
+                        selected = None
+
+        screen.fill(GAME_BG_COLOR)
+        valid_moves = compute_valid_moves(board, selected, current_player) if selected else []
+        draw_board(screen, board, selected, valid_moves)
+        pygame.display.flip()
+        clock.tick(30)
+
+# Função Principal do Menu
+def menu_principal():
+    button_pvp = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 - BUTTON_HEIGHT - 20, BUTTON_WIDTH, BUTTON_HEIGHT)
+    button_pvia = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 20, BUTTON_WIDTH, BUTTON_HEIGHT)
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == MOUSEBUTTONDOWN:
+                mouse_pos = pygame.mouse.get_pos()
+                if button_pvp.collidepoint(mouse_pos):
+                    print("Iniciando PLAYER VS PLAYER")
+                    iniciar_jogo_pvp()
+                elif button_pvia.collidepoint(mouse_pos):
+                    print("Iniciando PLAYER VS IA")
+                    try:
+                        pvia.iniciar_jogo_pvia()
+                    except Exception as e:
+                        print(f"Erro ao iniciar PLAYER VS IA: {e}")
+
+        draw_gradient_background()
+        title_surface = title_font.render("LINES OF ACTION", True, TITLE_COLOR)
+        title_rect = title_surface.get_rect(center=(MENU_WIDTH // 2, MENU_HEIGHT // 4))
+        screen.blit(title_surface, title_rect)
+        mouse_pos = pygame.mouse.get_pos()
+        pvp_hover = button_pvp.collidepoint(mouse_pos)
+        pvia_hover = button_pvia.collidepoint(mouse_pos)
+        draw_button("PLAYER VS PLAYER", button_pvp.x, button_pvp.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvp_hover)
+        draw_button("PLAYER VS IA", button_pvia.x, button_pvia.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_hover)
+        pygame.display.flip()
+        clock.tick(60)
+
+if __name__ == "__main__":
+    menu_principal()
