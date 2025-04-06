@@ -1,0 +1,267 @@
+import pygame
+import sys
+from pygame.locals import *
+import random
+
+# Constantes para o Jogo (devem ser iguais às do menu.py)
+BOARD_SIZE = 8
+SQUARE_SIZE = 80
+GAME_WIDTH = BOARD_SIZE * SQUARE_SIZE
+GAME_HEIGHT = BOARD_SIZE * SQUARE_SIZE
+LIGHT_SQUARE = (240, 217, 181)
+DARK_SQUARE = (181, 136, 99)
+BLACK_PIECE_COLOR = (0, 0, 0)
+WHITE_PIECE_COLOR = (255, 255, 255)
+SELECTED_COLOR = (0, 255, 0)
+VALID_MOVE_COLOR = (0, 0, 255)
+GAME_BG_COLOR = (50, 50, 50)
+
+# Inicialização do Pygame
+pygame.init()
+screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
+pygame.display.set_caption("Lines of Action - PLAYER VS IA")
+clock = pygame.time.Clock()
+
+# Fontes
+game_font = pygame.font.SysFont(None, 36)
+
+# Funções do Jogo
+def init_board():
+    """Inicializa o tabuleiro com peças pretas (B) e brancas (W) nas posições iniciais."""
+    board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    for col in range(1, BOARD_SIZE - 1):
+        board[0][col] = "B"
+        board[BOARD_SIZE - 1][col] = "B"
+    for row in range(1, BOARD_SIZE - 1):
+        board[row][0] = "W"
+        board[row][BOARD_SIZE - 1] = "W"
+    return board
+
+def draw_board(screen, board, selected, valid_moves=None):
+    """Desenha o tabuleiro e as peças na tela."""
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            square_color = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
+            rect = pygame.Rect(col * SQUARE_SIZE, row * SQUARE_SIZE, SQUARE_SIZE, SQUARE_SIZE)
+            pygame.draw.rect(screen, square_color, rect)
+            if selected == (row, col):
+                pygame.draw.rect(screen, SELECTED_COLOR, rect, 3)
+            if valid_moves and (row, col) in valid_moves:
+                pygame.draw.rect(screen, VALID_MOVE_COLOR, rect, 3)
+            piece = board[row][col]
+            if piece is not None:
+                center = (col * SQUARE_SIZE + SQUARE_SIZE // 2, row * SQUARE_SIZE + SQUARE_SIZE // 2)
+                radius = SQUARE_SIZE // 2 - 8
+                if piece == "B":
+                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius)
+                elif piece == "W":
+                    pygame.draw.circle(screen, WHITE_PIECE_COLOR, center, radius)
+                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius, 2)
+
+def get_board_pos(mouse_pos):
+    """Converte a posição do mouse em coordenadas do tabuleiro."""
+    x, y = mouse_pos
+    col = x // SQUARE_SIZE
+    row = y // SQUARE_SIZE
+    if 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE:
+        return (row, col)
+    return None
+
+def count_pieces_in_line(board, row, col, dr, dc):
+    """Conta o número de peças em uma linha na direção especificada."""
+    count = 0
+    r, c = row, col
+    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+        if board[r][c] is not None:
+            count += 1
+        r += dr
+        c += dc
+    r, c = row - dr, col - dc
+    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+        if board[r][c] is not None:
+            count += 1
+        r -= dr
+        c -= dc
+    return count
+
+def sign(x):
+    """Retorna o sinal de um número (-1, 0 ou 1)."""
+    return (x > 0) - (x < 0)
+
+def is_valid_move(board, selected, dest, current_player):
+    """Verifica se um movimento é válido."""
+    sr, sc = selected
+    dr = dest[0] - sr
+    dc = dest[1] - sc
+    if not ((dr == 0 and dc != 0) or (dc == 0 and dr != 0) or (abs(dr) == abs(dc) and dr != 0)):
+        return False, "Movimento fora de linha reta"
+    norm_dr = sign(dr)
+    norm_dc = sign(dc)
+    n = count_pieces_in_line(board, sr, sc, norm_dr, norm_dc)
+    expected_dest = (sr + n * norm_dr, sc + n * norm_dc)
+    if expected_dest != dest:
+        return False, f"Distância incorreta; deve mover {n} casas"
+    for i in range(1, n):
+        r = sr + i * norm_dr
+        c = sc + i * norm_dc
+        if board[r][c] is not None:
+            if board[r][c] != current_player:
+                return False, "Não pode saltar sobre peças adversárias"
+    dest_piece = board[dest[0]][dest[1]]
+    if dest_piece is not None and dest_piece == current_player:
+        return False, "Destino ocupado por peça amiga"
+    return True, ""
+
+def compute_valid_moves(board, selected, current_player):
+    """Calcula todos os movimentos válidos para uma peça selecionada."""
+    valid_moves = []
+    if selected is None:
+        return valid_moves
+    sr, sc = selected
+    directions = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+    for dr, dc in directions:
+        n = count_pieces_in_line(board, sr, sc, dr, dc)
+        if n == 0:
+            continue
+        candidate = (sr + n * dr, sc + n * dc)
+        r, c = candidate
+        if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+            continue
+        valid, _ = is_valid_move(board, selected, candidate, current_player)
+        if valid:
+            valid_moves.append(candidate)
+    return valid_moves
+
+def get_all_pieces(board, player):
+    """Retorna as posições de todas as peças de um jogador."""
+    positions = []
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if board[row][col] == player:
+                positions.append((row, col))
+    return positions
+
+def check_connected(board, player):
+    """Verifica se todas as peças de um jogador estão conectadas."""
+    pieces = get_all_pieces(board, player)
+    if not pieces:
+        return False
+    visited = set()
+    stack = [pieces[0]]
+    while stack:
+        pos = stack.pop()
+        if pos in visited:
+            continue
+        visited.add(pos)
+        r, c = pos
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                    if board[nr][nc] == player and (nr, nc) not in visited:
+                        stack.append((nr, nc))
+    return len(visited) == len(pieces)
+
+def show_message(screen, text):
+    """Exibe uma mensagem na tela por 3 segundos."""
+    overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
+    overlay.set_alpha(200)
+    overlay.fill((0, 0, 0))
+    screen.blit(overlay, (0, 0))
+    msg = game_font.render(text, True, (255, 255, 0))
+    msg_rect = msg.get_rect(center=(GAME_WIDTH//2, GAME_HEIGHT//2))
+    screen.blit(msg, msg_rect)
+    pygame.display.flip()
+    pygame.time.wait(3000)
+
+def ai_move(board, ai_player):
+    """Implementa a lógica da IA para escolher um movimento aleatório."""
+    pieces = get_all_pieces(board, ai_player)
+    random.shuffle(pieces)
+    for piece in pieces:
+        valid_moves = compute_valid_moves(board, piece, ai_player)
+        if valid_moves:
+            dest = random.choice(valid_moves)
+            return piece, dest
+    return None, None
+
+def iniciar_jogo_pvia():
+    """Função principal para o modo PLAYER VS IA."""
+    global screen
+    screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
+    pygame.display.set_caption("Lines of Action - PLAYER VS IA")
+
+    board = init_board()
+    human_player = "B"  # Humano joga com pretas
+    ai_player = "W"    # IA joga com brancas
+    current_player = human_player  # Humano começa
+    selected = None
+    game_over = False
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                screen = pygame.display.set_mode((800, 600))  # Volta ao tamanho do menu
+                pygame.display.set_caption("Lines of Action - Menu")
+                return
+            if game_over:
+                continue
+            if current_player == human_player and event.type == MOUSEBUTTONDOWN:
+                pos = get_board_pos(pygame.mouse.get_pos())
+                if pos is None:
+                    continue
+                r, c = pos
+                if selected is None:
+                    if board[r][c] == human_player:
+                        selected = (r, c)
+                else:
+                    valid, msg = is_valid_move(board, selected, pos, human_player)
+                    if valid:
+                        sr, sc = selected
+                        dr, dc = pos
+                        if board[dr][dc] is not None and board[dr][dc] != human_player:
+                            board[dr][dc] = None
+                        board[dr][dc] = human_player
+                        board[sr][sc] = None
+                        if check_connected(board, human_player):
+                            draw_board(screen, board, None)
+                            pygame.display.flip()
+                            show_message(screen, "Vitória para o Humano!")
+                            game_over = True
+                        else:
+                            current_player = ai_player
+                        selected = None
+                    else:
+                        print(f"Movimento inválido: {msg}")
+                        selected = None
+
+        if not game_over and current_player == ai_player:
+            piece, dest = ai_move(board, ai_player)
+            if piece and dest:
+                sr, sc = piece
+                dr, dc = dest
+                if board[dr][dc] is not None and board[dr][dc] != ai_player:
+                    board[dr][dc] = None
+                board[dr][dc] = ai_player
+                board[sr][sc] = None
+                if check_connected(board, ai_player):
+                    draw_board(screen, board, None)
+                    pygame.display.flip()
+                    show_message(screen, "Vitória para a IA!")
+                    game_over = True
+                else:
+                    current_player = human_player
+            else:
+                print("IA não pode fazer nenhum movimento. Passando o turno.")
+                current_player = human_player
+
+        screen.fill(GAME_BG_COLOR)
+        valid_moves = compute_valid_moves(board, selected, current_player) if selected else []
+        draw_board(screen, board, selected, valid_moves)
+        pygame.display.flip()
+        clock.tick(30)
+
+if __name__ == "__main__":
+    iniciar_jogo_pvia()
