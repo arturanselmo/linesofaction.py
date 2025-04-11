@@ -3,17 +3,22 @@ import sys
 from pygame.locals import *
 import copy
 import random
+import math
 
 # Constantes para o Menu
 MENU_WIDTH = 800
 MENU_HEIGHT = 600
-BUTTON_WIDTH = 300
-BUTTON_HEIGHT = 60
-BUTTON_COLOR = (50, 50, 50)
-BUTTON_HOVER_COLOR = (80, 80, 80)
+BUTTON_WIDTH = 250
+BUTTON_HEIGHT = 50
+SUB_BUTTON_WIDTH = 200
+SUB_BUTTON_HEIGHT = 40
+BUTTON_COLOR = (60, 60, 60)
+BUTTON_HOVER_COLOR = (90, 90, 90)
+BUTTON_HIGHLIGHT_COLOR = (120, 120, 120)
 TEXT_COLOR = (255, 255, 255)
-TITLE_COLOR = (255, 255, 255)
-BG_COLOR = (30, 10, 50)
+TITLE_COLOR = (220, 220, 255)
+BG_COLOR = (20, 20, 40)
+SHADOW_COLOR = (40, 40, 40, 100)
 
 # Constantes para o Jogo
 BOARD_SIZE = 8
@@ -32,32 +37,48 @@ GAME_BG_COLOR = (50, 50, 50)
 MAN_VALUE = 10
 MAX_DEPTH_EASY = 1
 MAX_DEPTH_HARD = 3
-MAX_DEPTH_VERY_HARD = 8  # New very hard difficulty
+MCTS_ITERATIONS_EASY = 100
+MCTS_ITERATIONS_HARD = 1000
+
+# Pesos para as heurísticas
+DISTANCE_WEIGHT = 5.0
+GROUP_WEIGHT = 20.0
+MOBILITY_WEIGHT = 2.0
+CENTRALITY_WEIGHT = 1.0
+CAPTURE_WEIGHT = 15.0
 
 # Inicialização do Pygame
 pygame.init()
-screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
+screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT), pygame.RESIZABLE)
 pygame.display.set_caption("Lines of Action - Menu")
 clock = pygame.time.Clock()
 
 # Fontes
-title_font = pygame.font.SysFont("Arial", 72, bold=True)
-button_font = pygame.font.SysFont("Arial", 36)
+title_font = pygame.font.SysFont("Verdana", 60, bold=True)
+button_font = pygame.font.SysFont("Verdana", 24)
+sub_button_font = pygame.font.SysFont("Verdana", 20)
 game_font = pygame.font.SysFont(None, 36)
+info_font = pygame.font.SysFont("Verdana", 16)
 
 # Funções do Menu
 def draw_gradient_background():
-    for y in range(MENU_HEIGHT):
-        r = 30 + (y / MENU_HEIGHT) * 20
-        g = 10 + (y / MENU_HEIGHT) * 20
-        b = 50 + (y / MENU_HEIGHT) * 50
-        pygame.draw.line(screen, (int(r), int(g), int(b)), (0, y), (MENU_WIDTH, y))
+    for y in range(screen.get_height()):
+        r = 20 + (y / screen.get_height()) * 40
+        g = 20 + (y / screen.get_height()) * 40
+        b = 40 + (y / screen.get_height()) * 60
+        pygame.draw.line(screen, (int(r), int(g), int(b)), (0, y), (screen.get_width(), y))
 
-def draw_button(text, x, y, width, height, hover=False):
-    color = BUTTON_HOVER_COLOR if hover else BUTTON_COLOR
-    pygame.draw.rect(screen, color, (x, y, width, height), border_radius=10)
-    pygame.draw.rect(screen, TEXT_COLOR, (x, y, width, height), 2, border_radius=10)
-    text_surface = button_font.render(text, True, TEXT_COLOR)
+def draw_button(text, x, y, width, height, hover=False, highlighted=False, font=button_font):
+    shadow_rect = pygame.Rect(x + 5, y + 5, width, height)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=15)
+    
+    if highlighted:
+        color = BUTTON_HIGHLIGHT_COLOR
+    else:
+        color = BUTTON_HOVER_COLOR if hover else BUTTON_COLOR
+    pygame.draw.rect(screen, color, (x, y, width, height), border_radius=15)
+    pygame.draw.rect(screen, TEXT_COLOR, (x, y, width, height), 2, border_radius=15)
+    text_surface = font.render(text, True, TEXT_COLOR)
     text_rect = text_surface.get_rect(center=(x + width // 2, y + height // 2))
     screen.blit(text_surface, text_rect)
 
@@ -190,6 +211,35 @@ def check_connected(board, player):
                     if board[nr][nc] == player and (nr, nc) not in visited:
                         stack.append((nr, nc))
     return len(visited) == len(pieces)
+
+def get_groups(board, player):
+    pieces = get_all_pieces(board, player)
+    if not pieces:
+        return []
+    groups = []
+    visited = set()
+    for piece in pieces:
+        if piece in visited:
+            continue
+        group = set()
+        stack = [piece]
+        while stack:
+            pos = stack.pop()
+            if pos in visited:
+                continue
+            visited.add(pos)
+            group.add(pos)
+            r, c = pos
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
+                        if board[nr][nc] == player and (nr, nc) not in visited:
+                            stack.append((nr, nc))
+        groups.append(group)
+    return groups
 
 def show_message(screen, text):
     overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
@@ -203,62 +253,242 @@ def show_message(screen, text):
     pygame.time.wait(3000)
 
 # AI Functions
-def get_ai_move(board, ai_player, difficulty="hard"):
+class Node:
+    def __init__(self, board, move=None, parent=None, player=None):
+        self.board = board
+        self.move = move
+        self.parent = parent
+        self.player = player
+        self.children = []
+        self.visits = 0
+        self.wins = 0
+
+    def is_leaf(self):
+        return len(self.children) == 0
+
+    def add_child(self, child):
+        self.children.append(child)
+
+    def uct(self, exploration_constant=0.7):
+        if self.visits == 0:
+            return float('inf')
+        parent_visits = self.parent.visits if self.parent else 1
+        return (self.wins / self.visits) + exploration_constant * math.sqrt(math.log(parent_visits) / self.visits)
+
+def mcts(board, player, iterations, eval_mode="classic"):
+    root = Node(board, player=player)
+    
+    for _ in range(iterations):
+        node = root
+        while not node.is_leaf() and not is_game_over(node.board):
+            node = max(node.children, key=lambda n: n.uct())
+        
+        if not is_game_over(node.board):
+            moves = get_all_valid_moves(node.board, node.player)
+            for move in moves:
+                new_board = apply_move(node.board, move)
+                child = Node(new_board, move=move, parent=node, player="W" if node.player == "B" else "B")
+                node.add_child(child)
+            if node.children:
+                node = random.choice(node.children)
+        
+        sim_board = copy.deepcopy(node.board)
+        sim_player = node.player
+        while not is_game_over(sim_board):
+            moves = get_all_valid_moves(sim_board, sim_player)
+            if not moves:
+                break
+            if eval_mode == "heuristic":
+                move_scores = []
+                for move in moves:
+                    new_board = apply_move(sim_board, move)
+                    score = evaluate_board_heuristic(new_board, sim_player)
+                    move_scores.append((move, score))
+                total_score = sum(max(0, score + 1000) for _, score in move_scores)
+                if total_score == 0:
+                    move = random.choice(moves)
+                else:
+                    weights = [max(0, score + 1000) / total_score for _, score in move_scores]
+                    move = random.choices([m for m, _ in move_scores], weights=weights, k=1)[0]
+            else:
+                move = random.choice(moves)
+            sim_board = apply_move(sim_board, move)
+            sim_player = "W" if sim_player == "B" else "B"
+        
+        winner = None
+        if check_connected(sim_board, "B"):
+            winner = "B"
+        elif check_connected(sim_board, "W"):
+            winner = "W"
+        
+        current = node
+        while current is not None:
+            current.visits += 1
+            if winner is not None:
+                if current.player == "W" and winner == player:
+                    current.wins += 1
+                elif current.player == player and winner == player:
+                    current.wins += 1
+            current = current.parent
+    
+    if not root.children:
+        return None
+    best_child = max(root.children, key=lambda n: n.visits)
+    return best_child.move
+
+def get_ai_move(board, ai_player, difficulty="hard", mode="minimax", eval_mode="classic"):
     moves = get_all_valid_moves(board, ai_player)
     if not moves:
         return None
     
-    if difficulty == "easy":
-        move_scores = []
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, MAX_DEPTH_EASY - 1, False, "W" if ai_player == "B" else "B", float('-inf'), float('inf'))
-            move_scores.append((move, score))
-        total_score = sum(max(0, score + 1000) for _, score in move_scores)
-        if total_score == 0:
-            return random.choice(moves)
-        weights = [max(0, score + 1000) / total_score for _, score in move_scores]
-        return random.choices([move for move, _ in move_scores], weights=weights, k=1)[0]
-    else:
-        # Hard or Very Hard mode with alpha-beta pruning
-        depth = MAX_DEPTH_VERY_HARD if difficulty == "very_hard" else MAX_DEPTH_HARD
-        best_move, best_score = None, float('-inf')
-        alpha, beta = float('-inf'), float('inf')
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, False, "W" if ai_player == "B" else "B", alpha, beta)
-            if score > best_score:
-                best_score, best_move = score, move
-            alpha = max(alpha, best_score)
-        return best_move
+    if mode == "random":
+        return random.choice(moves)
+    elif mode == "minimax":
+        if difficulty == "easy":
+            move_scores = []
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = minimax(new_board, MAX_DEPTH_EASY - 1, False, "W" if ai_player == "B" else "B", float('-inf'), float('inf'), eval_mode)
+                move_scores.append((move, score))
+            total_score = sum(max(0, score + 1000) for _, score in move_scores)
+            if total_score == 0:
+                return random.choice(moves)
+            weights = [max(0, score + 1000) / total_score for _, score in move_scores]
+            return random.choices([move for move, _ in move_scores], weights=weights, k=1)[0]
+        else:
+            depth = MAX_DEPTH_HARD
+            best_move, best_score = None, float('-inf')
+            alpha, beta = float('-inf'), float('inf')
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = minimax(new_board, depth - 1, False, "W" if ai_player == "B" else "B", alpha, beta, eval_mode)
+                if score > best_score:
+                    best_score, best_move = score, move
+                alpha = max(alpha, best_score)
+            return best_move
+    elif mode == "alpha-beta":
+        if difficulty == "easy":
+            move_scores = []
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = minimax_alpha_beta(new_board, MAX_DEPTH_EASY - 1, False, "W" if ai_player == "B" else "B", float('-inf'), float('inf'), eval_mode)
+                move_scores.append((move, score))
+            total_score = sum(max(0, score + 1000) for _, score in move_scores)
+            if total_score == 0:
+                return random.choice(moves)
+            weights = [max(0, score + 1000) / total_score for _, score in move_scores]
+            return random.choices([move for move, _ in move_scores], weights=weights, k=1)[0]
+        else:
+            depth = MAX_DEPTH_HARD
+            best_move, best_score = None, float('-inf')
+            alpha, beta = float('-inf'), float('inf')
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = minimax_alpha_beta(new_board, depth - 1, False, "W" if ai_player == "B" else "B", alpha, beta, eval_mode)
+                if score > best_score:
+                    best_score, best_move = score, move
+                alpha = max(alpha, best_score)
+            return best_move
+    elif mode == "negamax":
+        if difficulty == "easy":
+            move_scores = []
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = negamax(new_board, MAX_DEPTH_EASY, "W" if ai_player == "B" else "B", ai_player, eval_mode)
+                move_scores.append((move, score))
+            total_score = sum(max(0, score + 1000) for _, score in move_scores)
+            if total_score == 0:
+                return random.choice(moves)
+            weights = [max(0, score + 1000) / total_score for _, score in move_scores]
+            return random.choices([move for move, _ in move_scores], weights=weights, k=1)[0]
+        else:
+            depth = MAX_DEPTH_HARD
+            best_move, best_score = None, float('-inf')
+            for move in moves:
+                new_board = apply_move(board, move)
+                score = negamax(new_board, depth, "W" if ai_player == "B" else "B", ai_player, eval_mode)
+                if score > best_score:
+                    best_score, best_move = score, move
+            return best_move
+    elif mode == "mcts":
+        iterations = MCTS_ITERATIONS_EASY if difficulty == "easy" else MCTS_ITERATIONS_HARD
+        return mcts(board, ai_player, iterations, eval_mode)
 
-def minimax(board, depth, is_maximizing, player, alpha, beta):
+def minimax(board, depth, is_maximizing, player, alpha, beta, eval_mode="classic"):
     if depth == 0 or is_game_over(board):
-        return evaluate_board(board, "B")  # AI evaluation from Black's perspective
+        if eval_mode == "heuristic":
+            return evaluate_board_heuristic(board, "B")
+        else:
+            return evaluate_board_classic(board, "B")
     if is_maximizing:
         max_score = float('-inf')
         moves = get_all_valid_moves(board, player)
         for move in moves:
             new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, False, "W" if player == "B" else "B", alpha, beta)
+            score = minimax(new_board, depth - 1, False, "W" if player == "B" else "B", alpha, beta, eval_mode)
             max_score = max(max_score, score)
             alpha = max(alpha, max_score)
             if beta <= alpha:
-                break  # Alpha-beta pruning
+                break
         return max_score
     else:
         min_score = float('inf')
         moves = get_all_valid_moves(board, player)
         for move in moves:
             new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, True, "W" if player == "B" else "B", alpha, beta)
+            score = minimax(new_board, depth - 1, True, "W" if player == "B" else "B", alpha, beta, eval_mode)
             min_score = min(min_score, score)
             beta = min(beta, min_score)
             if beta <= alpha:
-                break  # Alpha-beta pruning
+                break
         return min_score
 
-def evaluate_board(board, ai_player):
+def minimax_alpha_beta(board, depth, is_maximizing, player, alpha, beta, eval_mode="classic"):
+    if depth == 0 or is_game_over(board):
+        if eval_mode == "heuristic":
+            return evaluate_board_heuristic(board, "B")
+        else:
+            return evaluate_board_classic(board, "B")
+    if is_maximizing:
+        max_score = float('-inf')
+        moves = get_all_valid_moves(board, player)
+        for move in moves:
+            new_board = apply_move(board, move)
+            score = minimax_alpha_beta(new_board, depth - 1, False, "W" if player == "B" else "B", alpha, beta, eval_mode)
+            max_score = max(max_score, score)
+            alpha = max(alpha, max_score)
+            if beta <= alpha:
+                break
+        return max_score
+    else:
+        min_score = float('inf')
+        moves = get_all_valid_moves(board, player)
+        for move in moves:
+            new_board = apply_move(board, move)
+            score = minimax_alpha_beta(new_board, depth - 1, True, "W" if player == "B" else "B", alpha, beta, eval_mode)
+            min_score = min(min_score, score)
+            beta = min(beta, min_score)
+            if beta <= alpha:
+                break
+        return min_score
+
+def negamax(board, depth, player, ai_player, eval_mode="classic"):
+    if depth == 0 or is_game_over(board):
+        if eval_mode == "heuristic":
+            score = evaluate_board_heuristic(board, ai_player)
+        else:
+            score = evaluate_board_classic(board, ai_player)
+        return score if player == ai_player else -score
+    
+    best_score = float('-inf')
+    moves = get_all_valid_moves(board, player)
+    for move in moves:
+        new_board = apply_move(board, move)
+        score = -negamax(new_board, depth - 1, "W" if player == "B" else "B", ai_player, eval_mode)
+        best_score = max(best_score, score)
+    return best_score
+
+def evaluate_board_classic(board, ai_player):
     score = 0
     opponent = "W" if ai_player == "B" else "B"
     ai_pieces = len(get_all_pieces(board, ai_player))
@@ -268,6 +498,73 @@ def evaluate_board(board, ai_player):
         score += 1000
     if check_connected(board, opponent):
         score -= 1000
+    return score
+
+def evaluate_board_heuristic(board, ai_player):
+    opponent = "W" if ai_player == "B" else "B"
+    
+    if check_connected(board, ai_player):
+        return 1000
+    if check_connected(board, opponent):
+        return -1000
+    
+    score = 0
+    
+    ai_pieces = len(get_all_pieces(board, ai_player))
+    opp_pieces = len(get_all_pieces(board, opponent))
+    score += MAN_VALUE * (ai_pieces - opp_pieces)
+    
+    ai_positions = get_all_pieces(board, ai_player)
+    opp_positions = get_all_pieces(board, opponent)
+    
+    if ai_positions:
+        ai_distance = 0
+        for i, (r1, c1) in enumerate(ai_positions):
+            for r2, c2 in ai_positions[i+1:]:
+                ai_distance += math.sqrt((r1 - r2)**2 + (c1 - c2)**2)
+        ai_distance /= max(1, len(ai_positions) * (len(ai_positions) - 1) / 2)
+        score -= DISTANCE_WEIGHT * ai_distance
+    
+    if opp_positions:
+        opp_distance = 0
+        for i, (r1, c1) in enumerate(opp_positions):
+            for r2, c2 in opp_positions[i+1:]:
+                opp_distance += math.sqrt((r1 - r2)**2 + (c1 - c2)**2)
+        opp_distance /= max(1, len(opp_positions) * (len(opp_positions) - 1) / 2)
+        score += DISTANCE_WEIGHT * opp_distance
+    
+    ai_groups = len(get_groups(board, ai_player))
+    opp_groups = len(get_groups(board, opponent))
+    score -= GROUP_WEIGHT * ai_groups
+    score += GROUP_WEIGHT * opp_groups
+    
+    ai_moves = len(get_all_valid_moves(board, ai_player))
+    opp_moves = len(get_all_valid_moves(board, opponent))
+    score += MOBILITY_WEIGHT * (ai_moves - opp_moves)
+    
+    center = (BOARD_SIZE / 2, BOARD_SIZE / 2)
+    ai_centrality = 0
+    for r, c in ai_positions:
+        distance_to_center = math.sqrt((r - center[0])**2 + (c - center[1])**2)
+        ai_centrality += (BOARD_SIZE - distance_to_center)
+    opp_centrality = 0
+    for r, c in opp_positions:
+        distance_to_center = math.sqrt((r - center[0])**2 + (c - center[1])**2)
+        opp_centrality += (BOARD_SIZE - distance_to_center)
+    score += CENTRALITY_WEIGHT * (ai_centrality - opp_centrality)
+    
+    ai_captures = 0
+    for move in get_all_valid_moves(board, ai_player):
+        (sr, sc), (dr, dc) = move
+        if board[dr][dc] is not None and board[dr][dc] != ai_player:
+            ai_captures += 1
+    opp_captures = 0
+    for move in get_all_valid_moves(board, opponent):
+        (sr, sc), (dr, dc) = move
+        if board[dr][dc] is not None and board[dr][dc] != opponent:
+            opp_captures += 1
+    score += CAPTURE_WEIGHT * (ai_captures - opp_captures)
+    
     return score
 
 def get_all_valid_moves(board, player):
@@ -291,21 +588,21 @@ def apply_move(board, move):
 def is_game_over(board):
     return check_connected(board, "B") or check_connected(board, "W")
 
-def iniciar_jogo(mode="pvp", difficulty="hard"):
+def iniciar_jogo(mode="pvp", difficulty="hard", ai_mode="minimax", eval_mode="classic"):
     global screen
     screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
     pygame.display.set_caption("Lines of Action")
 
     board = init_board()
-    current_player = "B"  # Preto começa
+    current_player = "B"
     selected = None
     game_over = False
-    ai_player = "W" if mode == "pvia" else None  # AI is White in PvAI
+    ai_player = "W" if mode == "pvia" else None
 
     while True:
         for event in pygame.event.get():
             if event.type == QUIT:
-                screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
+                screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT), pygame.RESIZABLE)
                 pygame.display.set_caption("Lines of Action - Menu")
                 return
             if game_over:
@@ -340,7 +637,7 @@ def iniciar_jogo(mode="pvp", difficulty="hard"):
                         selected = None
 
         if not game_over and current_player == ai_player:
-            move = get_ai_move(board, ai_player, difficulty)
+            move = get_ai_move(board, ai_player, difficulty, ai_mode, eval_mode)
             if move is None:
                 draw_board(screen, board, None)
                 pygame.display.flip()
@@ -367,446 +664,473 @@ def iniciar_jogo(mode="pvp", difficulty="hard"):
         clock.tick(30)
 
 def menu_principal():
-    button_pvp = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 - BUTTON_HEIGHT - 20, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_hard = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 20, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_easy = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 80, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_very_hard = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 140, BUTTON_WIDTH, BUTTON_HEIGHT)
-
-    while True:
-        for event in pygame.event.get():
-            if event.type == QUIT:
-                pygame.quit()
-                sys.exit()
-            if event.type == MOUSEBUTTONDOWN:
-                mouse_pos = pygame.mouse.get_pos()
-                if button_pvp.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvp")
-                elif button_pvia_hard.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="hard")
-                elif button_pvia_easy.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="easy")
-                elif button_pvia_very_hard.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="very_hard")
-
-        draw_gradient_background()
-        title_surface = title_font.render("LINES OF ACTION", True, TITLE_COLOR)
-        title_rect = title_surface.get_rect(center=(MENU_WIDTH // 2, MENU_HEIGHT // 4))
-        screen.blit(title_surface, title_rect)
-        mouse_pos = pygame.mouse.get_pos()
-        pvp_hover = button_pvp.collidepoint(mouse_pos)
-        pvia_hard_hover = button_pvia_hard.collidepoint(mouse_pos)
-        pvia_easy_hover = button_pvia_easy.collidepoint(mouse_pos)
-        pvia_very_hard_hover = button_pvia_very_hard.collidepoint(mouse_pos)
-        draw_button("PLAYER VS PLAYER", button_pvp.x, button_pvp.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvp_hover)
-        draw_button("PLAYER VS IA (HARD)", button_pvia_hard.x, button_pvia_hard.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_hard_hover)
-        draw_button("PLAYER VS IA (EASY)", button_pvia_easy.x, button_pvia_easy.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_easy_hover)
-        draw_button("PLAYER VS IA (VERY HARD)", button_pvia_very_hard.x, button_pvia_very_hard.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_very_hard_hover)
-        pygame.display.flip()
-        clock.tick(60)
-
-if __name__ == "__main__":
-    menu_principal()
-import sys
-from pygame.locals import *
-import copy
-import random
-
-# Constantes para o Menu
-MENU_WIDTH = 800
-MENU_HEIGHT = 600
-BUTTON_WIDTH = 300
-BUTTON_HEIGHT = 60
-BUTTON_COLOR = (50, 50, 50)
-BUTTON_HOVER_COLOR = (80, 80, 80)
-TEXT_COLOR = (255, 255, 255)
-TITLE_COLOR = (255, 255, 255)
-BG_COLOR = (30, 10, 50)
-
-# Constantes para o Jogo
-BOARD_SIZE = 8
-SQUARE_SIZE = 80
-GAME_WIDTH = BOARD_SIZE * SQUARE_SIZE
-GAME_HEIGHT = BOARD_SIZE * SQUARE_SIZE
-LIGHT_SQUARE = (240, 217, 181)
-DARK_SQUARE = (181, 136, 99)
-BLACK_PIECE_COLOR = (0, 0, 0)
-WHITE_PIECE_COLOR = (255, 255, 255)
-SELECTED_COLOR = (0, 255, 0)
-VALID_MOVE_COLOR = (0, 0, 255)
-GAME_BG_COLOR = (50, 50, 50)
-
-# Constantes da IA
-MAN_VALUE = 10
-MAX_DEPTH_EASY = 1
-MAX_DEPTH_HARD = 3
-MAX_DEPTH_VERY_HARD = 8
-
-# Inicialização do Pygame
-pygame.init()
-screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
-pygame.display.set_caption("Lines of Action - Menu")
-clock = pygame.time.Clock()
-
-# Fontes
-title_font = pygame.font.SysFont("Arial", 72, bold=True)
-button_font = pygame.font.SysFont("Arial", 36)
-game_font = pygame.font.SysFont(None, 36)
-
-# Funções do Menu
-def draw_gradient_background():
-    for y in range(MENU_HEIGHT):
-        r = 30 + (y / MENU_HEIGHT) * 20
-        g = 10 + (y / MENU_HEIGHT) * 20
-        b = 50 + (y / MENU_HEIGHT) * 50
-        pygame.draw.line(screen, (int(r), int(g), int(b)), (0, y), (MENU_WIDTH, y))
-
-def draw_button(text, x, y, width, height, hover=False):
-    color = BUTTON_HOVER_COLOR if hover else BUTTON_COLOR
-    pygame.draw.rect(screen, color, (x, y, width, height), border_radius=10)
-    pygame.draw.rect(screen, TEXT_COLOR, (x, y, width, height), 2, border_radius=10)
-    text_surface = button_font.render(text, True, TEXT_COLOR)
-    text_rect = text_surface.get_rect(center=(x + width // 2, y + height // 2))
-    screen.blit(text_surface, text_rect)
-
-# Funções do Jogo
-def init_board():
-    board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-    for col in range(1, BOARD_SIZE - 1):
-        board[0][col] = "B"
-        board[BOARD_SIZE - 1][col] = "B"
-    for row in range(1, BOARD_SIZE - 1):
-        board[row][0] = "W"
-        board[row][BOARD_SIZE - 1] = "W"
-    return board
-
-def draw_board(screen, board, selected, valid_moves=None):
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            square_color = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
-            rect = pygame.Rect(col * SQUARE_SIZE, row * SQUARE_SIZE, SQUARE_SIZE, SQUARE_SIZE)
-            pygame.draw.rect(screen, square_color, rect)
-            if selected == (row, col):
-                pygame.draw.rect(screen, SELECTED_COLOR, rect, 3)
-            if valid_moves and (row, col) in valid_moves:
-                pygame.draw.rect(screen, VALID_MOVE_COLOR, rect, 3)
-            piece = board[row][col]
-            if piece is not None:
-                center = (col * SQUARE_SIZE + SQUARE_SIZE // 2, row * SQUARE_SIZE + SQUARE_SIZE // 2)
-                radius = SQUARE_SIZE // 2 - 8
-                if piece == "B":
-                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius)
-                elif piece == "W":
-                    pygame.draw.circle(screen, WHITE_PIECE_COLOR, center, radius)
-                    pygame.draw.circle(screen, BLACK_PIECE_COLOR, center, radius, 2)
-
-def get_board_pos(mouse_pos):
-    x, y = mouse_pos
-    col = x // SQUARE_SIZE
-    row = y // SQUARE_SIZE
-    if 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE:
-        return (row, col)
-    return None
-
-def count_pieces_in_line(board, row, col, dr, dc):
-    count = 0
-    r, c = row, col
-    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
-        if board[r][c] is not None:
-            count += 1
-        r += dr
-        c += dc
-    r, c = row - dr, col - dc
-    while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
-        if board[r][c] is not None:
-            count += 1
-        r -= dr
-        c -= dc
-    return count
-
-def sign(x):
-    return (x > 0) - (x < 0)
-
-def is_valid_move(board, selected, dest, current_player):
-    sr, sc = selected
-    dr = dest[0] - sr
-    dc = dest[1] - sc
-    if not ((dr == 0 and dc != 0) or (dc == 0 and dr != 0) or (abs(dr) == abs(dc) and dr != 0)):
-        return False, "Movimento fora de linha reta"
-    norm_dr = sign(dr)
-    norm_dc = sign(dc)
-    n = count_pieces_in_line(board, sr, sc, norm_dr, norm_dc)
-    expected_dest = (sr + n * norm_dr, sc + n * norm_dc)
-    if expected_dest != dest:
-        return False, "Distância incorreta; deve mover {} casas".format(n)
-    for i in range(1, n):
-        r = sr + i * norm_dr
-        c = sc + i * norm_dc
-        if board[r][c] is not None:
-            if board[r][c] != current_player:
-                return False, "Não pode saltar sobre peças adversárias"
-    dest_piece = board[dest[0]][dest[1]]
-    if dest_piece is not None and dest_piece == current_player:
-        return False, "Destino ocupado por peça amiga"
-    return True, ""
-
-def compute_valid_moves(board, selected, current_player):
-    valid_moves = []
-    if selected is None:
-        return valid_moves
-    sr, sc = selected
-    directions = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
-    for dr, dc in directions:
-        n = count_pieces_in_line(board, sr, sc, dr, dc)
-        if n == 0:
-            continue
-        candidate = (sr + n * dr, sc + n * dc)
-        r, c = candidate
-        if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
-            continue
-        valid, _ = is_valid_move(board, selected, candidate, current_player)
-        if valid:
-            valid_moves.append(candidate)
-    return valid_moves
-
-def get_all_pieces(board, player):
-    positions = []
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            if board[row][col] == player:
-                positions.append((row, col))
-    return positions
-
-def check_connected(board, player):
-    pieces = get_all_pieces(board, player)
-    if not pieces:
-        return False
-    visited = set()
-    stack = [pieces[0]]
-    while stack:
-        pos = stack.pop()
-        if pos in visited:
-            continue
-        visited.add(pos)
-        r, c = pos
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-                    if board[nr][nc] == player and (nr, nc) not in visited:
-                        stack.append((nr, nc))
-    return len(visited) == len(pieces)
-
-def show_message(screen, text):
-    overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
-    overlay.set_alpha(200)
-    overlay.fill((0, 0, 0))
-    screen.blit(overlay, (0, 0))
-    msg = game_font.render(text, True, (255, 255, 0))
-    msg_rect = msg.get_rect(center=(GAME_WIDTH//2, GAME_HEIGHT//2))
-    screen.blit(msg, msg_rect)
-    pygame.display.flip()
-    pygame.time.wait(3000)
-
-# Funções da IA
-def get_ai_move(board, ai_player, difficulty="hard"):
-    moves = get_all_valid_moves(board, ai_player)
-    if not moves:
-        return None
-    
-    if difficulty == "easy":
-        move_scores = []
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, MAX_DEPTH_EASY - 1, False, "W" if ai_player == "B" else "B", float('-inf'), float('inf'))
-            move_scores.append((move, score))
-        total_score = sum(max(0, score + 1000) for _, score in move_scores)
-        if total_score == 0:
-            return random.choice(moves)
-        weights = [max(0, score + 1000) / total_score for _, score in move_scores]
-        return random.choices([move for move, _ in move_scores], weights=weights, k=1)[0]
-    else:
-        depth = MAX_DEPTH_VERY_HARD if difficulty == "very_hard" else MAX_DEPTH_HARD
-        best_move, best_score = None, float('-inf')
-        alpha, beta = float('-inf'), float('inf')
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, False, "W" if ai_player == "B" else "B", alpha, beta)
-            if score > best_score:
-                best_score, best_move = score, move
-            alpha = max(alpha, best_score)
-        return best_move
-
-def minimax(board, depth, is_maximizing, player, alpha, beta):
-    if depth == 0 or is_game_over(board):
-        return evaluate_board(board, "B")
-    if is_maximizing:
-        max_score = float('-inf')
-        moves = get_all_valid_moves(board, player)
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, False, "W" if player == "B" else "B", alpha, beta)
-            max_score = max(max_score, score)
-            alpha = max(alpha, max_score)
-            if beta <= alpha:
-                break
-        return max_score
-    else:
-        min_score = float('inf')
-        moves = get_all_valid_moves(board, player)
-        for move in moves:
-            new_board = apply_move(board, move)
-            score = minimax(new_board, depth - 1, True, "W" if player == "B" else "B", alpha, beta)
-            min_score = min(min_score, score)
-            beta = min(beta, min_score)
-            if beta <= alpha:
-                break
-        return min_score
-
-def evaluate_board(board, ai_player):
-    score = 0
-    opponent = "W" if ai_player == "B" else "B"
-    ai_pieces = len(get_all_pieces(board, ai_player))
-    opp_pieces = len(get_all_pieces(board, opponent))
-    score += MAN_VALUE * (ai_pieces - opp_pieces)
-    if check_connected(board, ai_player):
-        score += 1000
-    if check_connected(board, opponent):
-        score -= 1000
-    return score
-
-def get_all_valid_moves(board, player):
-    moves = []
-    pieces = get_all_pieces(board, player)
-    for piece in pieces:
-        valid_moves = compute_valid_moves(board, piece, player)
-        for dest in valid_moves:
-            moves.append((piece, dest))
-    return moves
-
-def apply_move(board, move):
-    new_board = copy.deepcopy(board)
-    (sr, sc), (dr, dc) = move
-    if new_board[dr][dc] is not None and new_board[dr][dc] != new_board[sr][sc]:
-        new_board[dr][dc] = None
-    new_board[dr][dc] = new_board[sr][sc]
-    new_board[sr][sc] = None
-    return new_board
-
-def is_game_over(board):
-    return check_connected(board, "B") or check_connected(board, "W")
-
-def iniciar_jogo(mode="pvp", difficulty="hard"):
     global screen
-    screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
-    pygame.display.set_caption("Lines of Action")
+    fullscreen = False
+    scroll_offset = 0
+    scroll_speed = 20
+    content_height = 0  # Altura total do conteúdo do menu
 
-    board = init_board()
-    current_player = "B"  # Preto começa
-    selected = None
-    game_over = False
-    ai_player = "W" if mode == "pvia" else None  # IA é Branca no PvAI
-
-    while True:
-        for event in pygame.event.get():
-            if event.type == QUIT:
-                screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT))
-                pygame.display.set_caption("Lines of Action - Menu")
-                return
-            if game_over:
-                continue
-            if event.type == MOUSEBUTTONDOWN and current_player != ai_player:
-                pos = get_board_pos(pygame.mouse.get_pos())
-                if pos is None:
-                    continue
-                r, c = pos
-                if selected is None:
-                    if board[r][c] == current_player:
-                        selected = (r, c)
-                else:
-                    valid, msg = is_valid_move(board, selected, pos, current_player)
-                    if valid:
-                        sr, sc = selected
-                        dr, dc = pos
-                        if board[dr][dc] is not None and board[dr][dc] != current_player:
-                            board[dr][dc] = None
-                        board[dr][dc] = current_player
-                        board[sr][sc] = None
-                        if check_connected(board, current_player):
-                            draw_board(screen, board, None)
-                            pygame.display.flip()
-                            show_message(screen, f"Vitória para { 'Preto' if current_player=='B' else 'Branco' }!")
-                            game_over = True
-                        else:
-                            current_player = "W" if current_player == "B" else "B"
-                        selected = None
-                    else:
-                        print("Movimento inválido:", msg)
-                        selected = None
-
-        if not game_over and current_player == ai_player:
-            move = get_ai_move(board, ai_player, difficulty)
-            if move is None:
-                draw_board(screen, board, None)
-                pygame.display.flip()
-                show_message(screen, f"Vitória para {'Preto' if ai_player == 'W' else 'Branco'}!")
-                game_over = True
-            else:
-                (sr, sc), (dr, dc) = move
-                if board[dr][dc] is not None and board[dr][dc] != ai_player:
-                    board[dr][dc] = None
-                board[dr][dc] = ai_player
-                board[sr][sc] = None
-                if check_connected(board, ai_player):
-                    draw_board(screen, board, None)
-                    pygame.display.flip()
-                    show_message(screen, f"Vitória para {'Branco' if ai_player == 'W' else 'Preto'}!")
-                    game_over = True
-                else:
-                    current_player = "B"
-
-        screen.fill(GAME_BG_COLOR)
-        valid_moves = compute_valid_moves(board, selected, current_player) if selected else []
-        draw_board(screen, board, selected, valid_moves)
-        pygame.display.flip()
-        clock.tick(30)
-
-def menu_principal():
-    button_pvp = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 - BUTTON_HEIGHT - 20, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_hard = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 20, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_easy = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 80, BUTTON_WIDTH, BUTTON_HEIGHT)
-    button_pvia_very_hard = pygame.Rect(MENU_WIDTH // 2 - BUTTON_WIDTH // 2, MENU_HEIGHT // 2 + 140, BUTTON_WIDTH, BUTTON_HEIGHT)
+    # Botões principais
+    button_pvp = pygame.Rect(0, 120, BUTTON_WIDTH, BUTTON_HEIGHT)
+    button_pvia = pygame.Rect(0, 170, BUTTON_WIDTH, BUTTON_HEIGHT)
+    
+    # Botões de "Player vs AI" (Classic e Heuristic)
+    button_classic = pygame.Rect(0, 220, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_heuristic = pygame.Rect(0, 260, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Classic"
+    button_classic_minimax = pygame.Rect(0, 300, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_classic_alpha_beta = pygame.Rect(0, 340, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_classic_negamax = pygame.Rect(0, 380, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_classic_mcts = pygame.Rect(0, 420, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_classic_random = pygame.Rect(0, 460, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Heuristic"
+    button_heuristic_minimax = pygame.Rect(0, 300, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_heuristic_alpha_beta = pygame.Rect(0, 340, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_heuristic_negamax = pygame.Rect(0, 380, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    button_heuristic_mcts = pygame.Rect(0, 420, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Classic -> Minimax"
+    button_classic_minimax_easy = pygame.Rect(0, 340, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_classic_minimax_hard = pygame.Rect(0, 375, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Classic -> Alpha-Beta"
+    button_classic_alpha_beta_easy = pygame.Rect(0, 380, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_classic_alpha_beta_hard = pygame.Rect(0, 415, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Classic -> Negamax"
+    button_classic_negamax_easy = pygame.Rect(0, 420, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_classic_negamax_hard = pygame.Rect(0, 455, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Classic -> MCTS"
+    button_classic_mcts_easy = pygame.Rect(0, 460, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_classic_mcts_hard = pygame.Rect(0, 495, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Heuristic -> Minimax"
+    button_heuristic_minimax_easy = pygame.Rect(0, 340, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_heuristic_minimax_hard = pygame.Rect(0, 375, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Heuristic -> Alpha-Beta"
+    button_heuristic_alpha_beta_easy = pygame.Rect(0, 380, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_heuristic_alpha_beta_hard = pygame.Rect(0, 415, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Heuristic -> Negamax"
+    button_heuristic_negamax_easy = pygame.Rect(0, 420, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_heuristic_negamax_hard = pygame.Rect(0, 455, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Botões de "Heuristic -> MCTS"
+    button_heuristic_mcts_easy = pygame.Rect(0, 460, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    button_heuristic_mcts_hard = pygame.Rect(0, 495, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT)
+    
+    # Variáveis de controle de expansão
+    pvia_expanded = False
+    classic_expanded = False
+    heuristic_expanded = False
+    
+    classic_minimax_expanded = False
+    classic_alpha_beta_expanded = False
+    classic_negamax_expanded = False
+    classic_mcts_expanded = False
+    classic_random_expanded = False
+    
+    heuristic_minimax_expanded = False
+    heuristic_alpha_beta_expanded = False
+    heuristic_negamax_expanded = False
+    heuristic_mcts_expanded = False
 
     while True:
+        mouse_pos = pygame.mouse.get_pos()
+        screen_width, screen_height = screen.get_width(), screen.get_height()
+        
+        # Ajustar posições dos botões com base na largura da tela
+        button_pvp.x = screen_width // 2 - BUTTON_WIDTH // 2
+        button_pvia.x = screen_width // 2 - BUTTON_WIDTH // 2
+        
+        button_classic.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_heuristic.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        
+        button_classic_minimax.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_classic_alpha_beta.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_classic_negamax.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_classic_mcts.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_classic_random.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        
+        button_heuristic_minimax.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_heuristic_alpha_beta.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_heuristic_negamax.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        button_heuristic_mcts.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2
+        
+        button_classic_minimax_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_minimax_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_alpha_beta_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_alpha_beta_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_negamax_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_negamax_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_mcts_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_classic_mcts_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        
+        button_heuristic_minimax_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_minimax_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_alpha_beta_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_alpha_beta_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_negamax_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_negamax_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_mcts_easy.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+        button_heuristic_mcts_hard.x = screen_width // 2 - SUB_BUTTON_WIDTH // 2 + SUB_BUTTON_WIDTH + 10
+
         for event in pygame.event.get():
             if event.type == QUIT:
                 pygame.quit()
                 sys.exit()
+            if event.type == VIDEORESIZE:
+                screen_width, screen_height = event.w, event.h
+                if not fullscreen:
+                    screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+            if event.type == MOUSEWHEEL:
+                scroll_offset += event.y * scroll_speed
+            if event.type == KEYDOWN:
+                if event.key == K_UP:
+                    scroll_offset += scroll_speed
+                if event.key == K_DOWN:
+                    scroll_offset -= scroll_speed
+                if event.key == K_f:  # Tecla F para alternar fullscreen
+                    fullscreen = not fullscreen
+                    if fullscreen:
+                        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN | pygame.RESIZABLE)
+                    else:
+                        screen = pygame.display.set_mode((MENU_WIDTH, MENU_HEIGHT), pygame.RESIZABLE)
             if event.type == MOUSEBUTTONDOWN:
-                mouse_pos = pygame.mouse.get_pos()
-                if button_pvp.collidepoint(mouse_pos):
+                adjusted_mouse_pos = (mouse_pos[0], mouse_pos[1] - scroll_offset)
+                if button_pvp.collidepoint(adjusted_mouse_pos):
                     iniciar_jogo(mode="pvp")
-                elif button_pvia_hard.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="hard")
-                elif button_pvia_easy.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="easy")
-                elif button_pvia_very_hard.collidepoint(mouse_pos):
-                    iniciar_jogo(mode="pvia", difficulty="very_hard")
+                elif button_pvia.collidepoint(adjusted_mouse_pos) and not pvia_expanded:
+                    pvia_expanded = True
+                    classic_expanded = False
+                    heuristic_expanded = False
+                    classic_minimax_expanded = False
+                    classic_alpha_beta_expanded = False
+                    classic_negamax_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                    heuristic_minimax_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_negamax_expanded = False
+                    heuristic_mcts_expanded = False
+                
+                elif pvia_expanded and button_classic.collidepoint(adjusted_mouse_pos):
+                    classic_expanded = not classic_expanded
+                    heuristic_expanded = False
+                    heuristic_minimax_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_negamax_expanded = False
+                    heuristic_mcts_expanded = False
+                elif pvia_expanded and button_heuristic.collidepoint(adjusted_mouse_pos):
+                    heuristic_expanded = not heuristic_expanded
+                    classic_expanded = False
+                    classic_minimax_expanded = False
+                    classic_alpha_beta_expanded = False
+                    classic_negamax_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                
+                elif pvia_expanded and classic_expanded and button_classic_minimax.collidepoint(adjusted_mouse_pos):
+                    classic_minimax_expanded = not classic_minimax_expanded
+                    classic_alpha_beta_expanded = False
+                    classic_negamax_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                elif pvia_expanded and classic_expanded and button_classic_alpha_beta.collidepoint(adjusted_mouse_pos):
+                    classic_alpha_beta_expanded = not classic_alpha_beta_expanded
+                    classic_minimax_expanded = False
+                    classic_negamax_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                elif pvia_expanded and classic_expanded and button_classic_negamax.collidepoint(adjusted_mouse_pos):
+                    classic_negamax_expanded = not classic_negamax_expanded
+                    classic_minimax_expanded = False
+                    classic_alpha_beta_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                elif pvia_expanded and classic_expanded and button_classic_mcts.collidepoint(adjusted_mouse_pos):
+                    classic_mcts_expanded = not classic_mcts_expanded
+                    classic_minimax_expanded = False
+                    classic_alpha_beta_expanded = False
+                    classic_negamax_expanded = False
+                    classic_random_expanded = False
+                elif pvia_expanded and classic_expanded and button_classic_random.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", ai_mode="random", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_random_expanded = False
+                
+                elif pvia_expanded and heuristic_expanded and button_heuristic_minimax.collidepoint(adjusted_mouse_pos):
+                    heuristic_minimax_expanded = not heuristic_minimax_expanded
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_negamax_expanded = False
+                    heuristic_mcts_expanded = False
+                elif pvia_expanded and heuristic_expanded and button_heuristic_alpha_beta.collidepoint(adjusted_mouse_pos):
+                    heuristic_alpha_beta_expanded = not heuristic_alpha_beta_expanded
+                    heuristic_minimax_expanded = False
+                    heuristic_negamax_expanded = False
+                    heuristic_mcts_expanded = False
+                elif pvia_expanded and heuristic_expanded and button_heuristic_negamax.collidepoint(adjusted_mouse_pos):
+                    heuristic_negamax_expanded = not heuristic_negamax_expanded
+                    heuristic_minimax_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_mcts_expanded = False
+                elif pvia_expanded and heuristic_expanded and button_heuristic_mcts.collidepoint(adjusted_mouse_pos):
+                    heuristic_mcts_expanded = not heuristic_mcts_expanded
+                    heuristic_minimax_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_negamax_expanded = False
+                
+                elif pvia_expanded and classic_expanded and classic_minimax_expanded and button_classic_minimax_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="minimax", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_minimax_expanded = False
+                elif pvia_expanded and classic_expanded and classic_minimax_expanded and button_classic_minimax_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="minimax", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_minimax_expanded = False
+                
+                elif pvia_expanded and classic_expanded and classic_alpha_beta_expanded and button_classic_alpha_beta_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="alpha-beta", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_alpha_beta_expanded = False
+                elif pvia_expanded and classic_expanded and classic_alpha_beta_expanded and button_classic_alpha_beta_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="alpha-beta", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_alpha_beta_expanded = False
+                
+                elif pvia_expanded and classic_expanded and classic_negamax_expanded and button_classic_negamax_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="negamax", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_negamax_expanded = False
+                elif pvia_expanded and classic_expanded and classic_negamax_expanded and button_classic_negamax_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="negamax", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_negamax_expanded = False
+                
+                elif pvia_expanded and classic_expanded and classic_mcts_expanded and button_classic_mcts_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="mcts", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_mcts_expanded = False
+                elif pvia_expanded and classic_expanded and classic_mcts_expanded and button_classic_mcts_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="mcts", eval_mode="classic")
+                    pvia_expanded = False
+                    classic_expanded = False
+                    classic_mcts_expanded = False
+                
+                elif pvia_expanded and heuristic_expanded and heuristic_minimax_expanded and button_heuristic_minimax_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="minimax", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_minimax_expanded = False
+                elif pvia_expanded and heuristic_expanded and heuristic_minimax_expanded and button_heuristic_minimax_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="minimax", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_minimax_expanded = False
+                
+                elif pvia_expanded and heuristic_expanded and heuristic_alpha_beta_expanded and button_heuristic_alpha_beta_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="alpha-beta", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                elif pvia_expanded and heuristic_expanded and heuristic_alpha_beta_expanded and button_heuristic_alpha_beta_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="alpha-beta", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                
+                elif pvia_expanded and heuristic_expanded and heuristic_negamax_expanded and button_heuristic_negamax_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="negamax", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_negamax_expanded = False
+                elif pvia_expanded and heuristic_expanded and heuristic_negamax_expanded and button_heuristic_negamax_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="negamax", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_negamax_expanded = False
+                
+                elif pvia_expanded and heuristic_expanded and heuristic_mcts_expanded and button_heuristic_mcts_easy.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="easy", ai_mode="mcts", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_mcts_expanded = False
+                elif pvia_expanded and heuristic_expanded and heuristic_mcts_expanded and button_heuristic_mcts_hard.collidepoint(adjusted_mouse_pos):
+                    iniciar_jogo(mode="pvia", difficulty="hard", ai_mode="mcts", eval_mode="heuristic")
+                    pvia_expanded = False
+                    heuristic_expanded = False
+                    heuristic_mcts_expanded = False
+                
+                elif not (button_pvia.collidepoint(adjusted_mouse_pos) or 
+                          button_classic.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_minimax.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_alpha_beta.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_negamax.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_mcts.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_random.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_minimax.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_alpha_beta.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_negamax.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_mcts.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_minimax_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_minimax_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_alpha_beta_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_alpha_beta_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_negamax_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_negamax_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_mcts_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_classic_mcts_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_minimax_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_minimax_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_alpha_beta_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_alpha_beta_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_negamax_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_negamax_hard.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_mcts_easy.collidepoint(adjusted_mouse_pos) or 
+                          button_heuristic_mcts_hard.collidepoint(adjusted_mouse_pos)):
+                    pvia_expanded = False
+                    classic_expanded = False
+                    heuristic_expanded = False
+                    classic_minimax_expanded = False
+                    classic_alpha_beta_expanded = False
+                    classic_negamax_expanded = False
+                    classic_mcts_expanded = False
+                    classic_random_expanded = False
+                    heuristic_minimax_expanded = False
+                    heuristic_alpha_beta_expanded = False
+                    heuristic_negamax_expanded = False
+                    heuristic_mcts_expanded = False
 
+        # Calcular a altura total do conteúdo
+        content_height = 220  # Altura inicial até o botão "Player vs AI"
+        if pvia_expanded:
+            content_height = 300  # Após expandir "Player vs AI"
+            if classic_expanded:
+                content_height = 500  # Após expandir "Classic" (includes Random)
+                if classic_minimax_expanded:
+                    content_height = 410 + 70
+                if classic_alpha_beta_expanded:
+                    content_height = max(content_height, 450 + 70)
+                if classic_negamax_expanded:
+                    content_height = max(content_height, 490 + 70)
+                if classic_mcts_expanded:
+                    content_height = max(content_height, 530 + 70)
+            if heuristic_expanded:
+                content_height = max(content_height, 460)  # Após expandir "Heuristic"
+                if heuristic_minimax_expanded:
+                    content_height = max(content_height, 410 + 70)
+                if heuristic_alpha_beta_expanded:
+                    content_height = max(content_height, 450 + 70)
+                if heuristic_negamax_expanded:
+                    content_height = max(content_height, 490 + 70)
+                if heuristic_mcts_expanded:
+                    content_height = max(content_height, 530 + 70)
+
+        # Limitar o scroll
+        scroll_offset = min(0, max(scroll_offset, screen_height - content_height - 50))  # 50 para margem inferior e texto
+
+        # Desenhar fundo e título
         draw_gradient_background()
         title_surface = title_font.render("LINES OF ACTION", True, TITLE_COLOR)
-        title_rect = title_surface.get_rect(center=(MENU_WIDTH // 2, MENU_HEIGHT // 4))
+        title_rect = title_surface.get_rect(center=(screen_width//2, 50 + scroll_offset))
         screen.blit(title_surface, title_rect)
-        mouse_pos = pygame.mouse.get_pos()
-        pvp_hover = button_pvp.collidepoint(mouse_pos)
-        pvia_hard_hover = button_pvia_hard.collidepoint(mouse_pos)
-        pvia_easy_hover = button_pvia_easy.collidepoint(mouse_pos)
-        pvia_very_hard_hover = button_pvia_very_hard.collidepoint(mouse_pos)
-        draw_button("PLAYER VS PLAYER", button_pvp.x, button_pvp.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvp_hover)
-        draw_button("PLAYER VS IA (HARD)", button_pvia_hard.x, button_pvia_hard.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_hard_hover)
-        draw_button("PLAYER VS IA (EASY)", button_pvia_easy.x, button_pvia_easy.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_easy_hover)
-        draw_button("PLAYER VS IA (VERY HARD)", button_pvia_very_hard.x, button_pvia_very_hard.y, BUTTON_WIDTH, BUTTON_HEIGHT, pvia_very_hard_hover)
+
+        # Desenhar botões principais
+        draw_button("PLAYER VS PLAYER", button_pvp.x, button_pvp.y + scroll_offset, BUTTON_WIDTH, BUTTON_HEIGHT, button_pvp.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)))
+        draw_button("PLAYER VS AI", button_pvia.x, button_pvia.y + scroll_offset, BUTTON_WIDTH, BUTTON_HEIGHT, button_pvia.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=pvia_expanded)
+        
+        if pvia_expanded:
+            draw_button("Classic", button_classic.x, button_classic.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_expanded, font=sub_button_font)
+            draw_button("Heuristic", button_heuristic.x, button_heuristic.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_heuristic.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=heuristic_expanded, font=sub_button_font)
+            
+            arrow = sub_button_font.render("▼", True, TEXT_COLOR)
+            screen.blit(arrow, (button_pvia.right - 40, button_pvia.centery + scroll_offset - 15))
+
+            if classic_expanded:
+                draw_button("Minimax", button_classic_minimax.x, button_classic_minimax.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic_minimax.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_minimax_expanded, font=sub_button_font)
+                draw_button("Alpha-Beta", button_classic_alpha_beta.x, button_classic_alpha_beta.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic_alpha_beta.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_alpha_beta_expanded, font=sub_button_font)
+                draw_button("Negamax", button_classic_negamax.x, button_classic_negamax.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic_negamax.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_negamax_expanded, font=sub_button_font)
+                draw_button("MCTS", button_classic_mcts.x, button_classic_mcts.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic_mcts.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_mcts_expanded, font=sub_button_font)
+                draw_button("Random", button_classic_random.x, button_classic_random.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_classic_random.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=classic_random_expanded, font=sub_button_font)
+                
+                arrow = sub_button_font.render("▼", True, TEXT_COLOR)
+                screen.blit(arrow, (button_classic.right - 40, button_classic.centery + scroll_offset - 15))
+
+                if classic_minimax_expanded:
+                    draw_button("Easy", button_classic_minimax_easy.x, button_classic_minimax_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_minimax_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_classic_minimax_hard.x, button_classic_minimax_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_minimax_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_classic_minimax.right - 40, button_classic_minimax.centery + scroll_offset - 15))
+
+                if classic_alpha_beta_expanded:
+                    draw_button("Easy", button_classic_alpha_beta_easy.x, button_classic_alpha_beta_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_alpha_beta_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_classic_alpha_beta_hard.x, button_classic_alpha_beta_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_alpha_beta_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_classic_alpha_beta.right - 40, button_classic_alpha_beta.centery + scroll_offset - 15))
+
+                if classic_negamax_expanded:
+                    draw_button("Easy", button_classic_negamax_easy.x, button_classic_negamax_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_negamax_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_classic_negamax_hard.x, button_classic_negamax_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_negamax_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_classic_negamax.right - 40, button_classic_negamax.centery + scroll_offset - 15))
+
+                if classic_mcts_expanded:
+                    draw_button("Easy", button_classic_mcts_easy.x, button_classic_mcts_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_mcts_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_classic_mcts_hard.x, button_classic_mcts_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_classic_mcts_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_classic_mcts.right - 40, button_classic_mcts.centery + scroll_offset - 15))
+
+            if heuristic_expanded:
+                draw_button("Minimax", button_heuristic_minimax.x, button_heuristic_minimax.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_heuristic_minimax.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=heuristic_minimax_expanded, font=sub_button_font)
+                draw_button("Alpha-Beta", button_heuristic_alpha_beta.x, button_heuristic_alpha_beta.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_heuristic_alpha_beta.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=heuristic_alpha_beta_expanded, font=sub_button_font)
+                draw_button("Negamax", button_heuristic_negamax.x, button_heuristic_negamax.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_heuristic_negamax.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=heuristic_negamax_expanded, font=sub_button_font)
+                draw_button("MCTS", button_heuristic_mcts.x, button_heuristic_mcts.y + scroll_offset, SUB_BUTTON_WIDTH, SUB_BUTTON_HEIGHT, button_heuristic_mcts.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), highlighted=heuristic_mcts_expanded, font=sub_button_font)
+                
+                arrow = sub_button_font.render("▼", True, TEXT_COLOR)
+                screen.blit(arrow, (button_heuristic.right - 40, button_heuristic.centery + scroll_offset - 15))
+
+                if heuristic_minimax_expanded:
+                    draw_button("Easy", button_heuristic_minimax_easy.x, button_heuristic_minimax_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_minimax_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_heuristic_minimax_hard.x, button_heuristic_minimax_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_minimax_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_heuristic_minimax.right - 40, button_heuristic_minimax.centery + scroll_offset - 15))
+
+                if heuristic_alpha_beta_expanded:
+                    draw_button("Easy", button_heuristic_alpha_beta_easy.x, button_heuristic_alpha_beta_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_alpha_beta_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_heuristic_alpha_beta_hard.x, button_heuristic_alpha_beta_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_alpha_beta_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_heuristic_alpha_beta.right - 40, button_heuristic_alpha_beta.centery + scroll_offset - 15))
+
+                if heuristic_negamax_expanded:
+                    draw_button("Easy", button_heuristic_negamax_easy.x, button_heuristic_negamax_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_negamax_easy.collidepoint((mouse_pos[0], max(0, mouse_pos[1] - scroll_offset))), font=sub_button_font)
+                    draw_button("Hard", button_heuristic_negamax_hard.x, button_heuristic_negamax_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_negamax_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_heuristic_negamax.right - 40, button_heuristic_negamax.centery + scroll_offset - 15))
+
+                if heuristic_mcts_expanded:
+                    draw_button("Easy", button_heuristic_mcts_easy.x, button_heuristic_mcts_easy.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_mcts_easy.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    draw_button("Hard", button_heuristic_mcts_hard.x, button_heuristic_mcts_hard.y + scroll_offset, SUB_BUTTON_WIDTH - 40, SUB_BUTTON_HEIGHT, button_heuristic_mcts_hard.collidepoint((mouse_pos[0], mouse_pos[1] - scroll_offset)), font=sub_button_font)
+                    arrow = sub_button_font.render("▶", True, TEXT_COLOR)
+                    screen.blit(arrow, (button_heuristic_mcts.right - 40, button_heuristic_mcts.centery + scroll_offset - 15))
+
+        # Desenhar mensagem informativa sobre a tecla F
+        info_text = info_font.render("Press F to toggle Fullscreen", True, TEXT_COLOR)
+        info_rect = info_text.get_rect(bottom=screen_height - 10, right=screen_width - 10)
+        screen.blit(info_text, info_rect)
+
         pygame.display.flip()
         clock.tick(60)
 
